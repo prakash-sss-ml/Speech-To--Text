@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Live Speech-to-Text</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, sans-serif; color: #1f2937; background: #f4f7fb; }
+    body { margin: 0; padding: 24px; }
+    main { max-width: 850px; margin: 35px auto; background: white; border: 1px solid #dfe5ed; border-radius: 18px; padding: 28px; box-shadow: 0 15px 40px #1c376014; }
+    h1 { margin-top: 0; } p { color: #64748b; }
+    .toolbar { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; margin: 22px 0; }
+    label { display: grid; gap: 7px; font-weight: 600; font-size: 14px; }
+    select, button { border-radius: 9px; padding: 11px 14px; border: 1px solid #cbd5e1; font-size: 14px; background: white; }
+    button { cursor: pointer; font-weight: 650; } button:disabled { cursor: not-allowed; opacity: .5; }
+    #start { background: #1669e2; color: white; border-color: #1669e2; }
+    #stop { background: #fff1f2; color: #b91c1c; border-color: #fecdd3; }
+    #status { font-weight: 600; font-size: 14px; color: #334155; }
+    #transcript { white-space: pre-wrap; min-height: 210px; border: 1px solid #dbe2ec; border-radius: 12px; padding: 16px; line-height: 1.75; background: #fafcff; }
+    .footer { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+    .note { margin-top: 20px; font-size: 13px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>🎙 Live Speech-to-Text</h1>
+  <p>Speak into your microphone. Your speech is sent to your local FastAPI server and converted into text every few seconds.</p>
+  <div class="toolbar">
+    <label>Language
+      <select id="language">
+        <option value="auto">Auto-detect</option>
+        <option value="en">English</option>
+        <option value="ta">Tamil</option>
+        <option value="ko">Korean</option>
+        <option value="hi">Hindi</option>
+      </select>
+    </label>
+    <button id="start">Start microphone</button>
+    <button id="stop" disabled>Stop</button>
+    <span id="status" aria-live="polite">Ready</span>
+  </div>
+  <div id="transcript" aria-live="polite">Your transcript will appear here...</div>
+  <div class="footer">
+    <button id="copy">Copy transcript</button>
+    <button id="download">Download .txt</button>
+    <button id="clear">Clear</button>
+  </div>
+  <p class="note">Processing is chunk-based near real time, not word-by-word. First run may download the model. Use localhost or HTTPS, and only capture audio with permission.</p>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let ws = null, stream = null, context = null, source = null, worklet = null;
+let fullText = '', recording = false, stopping = false;
+const status = text => $('status').textContent = text;
+function render() { $('transcript').textContent = fullText || 'Your transcript will appear here...'; }
+function closeAudio() {
+  if (worklet) { worklet.port.onmessage = null; try { worklet.disconnect(); } catch {} worklet = null; }
+  if (source) { try { source.disconnect(); } catch {} source = null; }
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (context) { const old = context; context = null; old.close().catch(() => {}); }
+}
+function resetButtons() { recording = false; stopping = false; $('start').disabled = false; $('stop').disabled = true; $('language').disabled = false; }
+$('start').onclick = async () => {
+  if (recording || stopping) return;
+  if (!navigator.mediaDevices?.getUserMedia || !window.AudioWorkletNode) {
+    status('Microphone requires modern browser on localhost/HTTPS.'); return;
+  }
+  $('start').disabled = true;
+  $('language').disabled = true;
+  status('Connecting...');
+  try {
+    ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/transcribe`);
+    await new Promise((resolve, reject) => {
+      ws.onopen = resolve;
+      ws.onerror = () => reject(new Error('WebSocket connection failed'));
+    });
+    ws.onmessage = ev => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'segment' && msg.text) { fullText += (fullText ? ' ' : '') + msg.text; render(); }
+      if (msg.type === 'done') { status('Finished'); ws.close(); }
+      if (msg.type === 'error') status('Error: ' + msg.message);
+    };
+    ws.onclose = () => {
+      closeAudio(); resetButtons();
+      if (recording || stopping) status('Disconnected');
+    };
+    ws.send(JSON.stringify({ type: 'config', language: $('language').value }));
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    context = new AudioContext();
+    await context.audioWorklet.addModule('/static/pcm-worklet.js');
+    source = context.createMediaStreamSource(stream);
+    worklet = new AudioWorkletNode(context, 'pcm-worklet');
+    worklet.port.onmessage = event => {
+      if (ws?.readyState === WebSocket.OPEN && recording && !stopping) {
+        // Float32Array is little-endian on mainstream browser platforms.
+        ws.send(event.data.buffer);
+      }
+    };
+    source.connect(worklet);
+    worklet.connect(context.destination);
+    await context.resume();
+    recording = true;
+    $('stop').disabled = false;
+    status('Listening • transcription appears every ~3.5 seconds');
+  } catch (err) {
+    closeAudio();
+    if (ws && ws.readyState <= WebSocket.OPEN) ws.close();
+    resetButtons(); status('Error: ' + err.message);
+  }
+};
+$('stop').onclick = () => {
+  if (!recording || stopping) return;
+  stopping = true;
+  $('stop').disabled = true;
+  status('Finishing transcription...');
+  // Stop microphone first, then tell server to flush its remaining audio.
+  closeAudio();
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'stop' }));
+  else { resetButtons(); status('Stopped'); }
+};
+$('copy').onclick = async () => { try { await navigator.clipboard.writeText(fullText); status('Copied'); } catch { status('Clipboard unavailable'); } };
+$('download').onclick = () => {
+  const blob = new Blob([fullText], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = 'transcript.txt'; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+$('clear').onclick = () => { fullText = ''; render(); status('Cleared'); };
+window.addEventListener('beforeunload', () => { closeAudio(); if (ws) ws.close(); });
+</script>
+</body>
+</html>
