@@ -43,3 +43,9 @@ python -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
 Open http://127.0.0.1:8000. This entry point reads environment variables, not Streamlit Secrets. The existing `/health` and `/ws/transcribe` endpoints remain available in this mode.
+
+## Deployment error: No module named tornado
+
+The WebRTC component imports Tornado. It is declared explicitly in requirements.txt, and Streamlit is pinned to 1.41.1 to avoid automatically upgrading to a different server implementation. Use Python 3.11 for this dependency set.
+
+If Cloud logs show Python 3.14, save your app secrets and deployment settings, then delete and redeploy the Cloud app. Select Python 3.11 under Advanced settings before deploying; changing requirements.txt or rebooting does not change an existing app's Python version.
